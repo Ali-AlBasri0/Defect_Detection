@@ -7,7 +7,7 @@ from a link you put in the Streamlit secret MODEL_ZIP_URLS, the first time
 that product is used.
 
 Secret example (Streamlit Cloud -> Settings -> Secrets):
-    MODEL_ZIP_URLS = "https://github.com/YOU/REPO/releases/download/models/Bottle.zip,https://github.com/YOU/REPO/releases/download/models/Cable.zip"
+    MODEL_ZIP_URLS = "https://github.com/Ali-AlBasri0/Defect_Detection/releases/download/models/pcb.zip,https://github.com/Ali-AlBasri0/Defect_Detection/releases/download/models/audiojack.zip"
 """
 import gc
 import io
@@ -100,35 +100,14 @@ VIEW_HINTS = {
 COMMON_TIPS = [
     "Use bright, even light and avoid strong shadows or reflections.",
     "Show the whole product and keep the photo sharp (hold still).",
-    "Use the same background, distance and angle as the training photos.",
+    "Use a white background and take the photo from a close distance.",
 ]
-
-
-def view_map(view):
-    """Small top-down map. The selected view is shown as [Cx]."""
-    def tag(v):
-        return f"[{v}]" if v == view else f" {v} "
-
-    return "\n".join([
-        f"{tag('C5')}{' ' * 14}{tag('C4')}",
-        "  ┌" + "─" * 16 + "┐",
-        "  │" + f"{tag('C1')} from above".center(16) + "│",
-        "  │" + "PRODUCT".center(16) + "│",
-        "  └" + "─" * 16 + "┘",
-        f"{tag('C2')}{' ' * 14}{tag('C3')}",
-        "(front)".center(22),
-    ])
 
 
 def show_hint(view):
     hint = VIEW_HINTS[view]
-    left, right = st.columns([3, 2])
-    with left:
-        st.info(f"### {hint['icon']} {hint['title']}\n\n{hint['how']}")
-        st.markdown("\n".join(f"- {tip}" for tip in hint["tips"] + COMMON_TIPS))
-    with right:
-        st.caption("Where to stand (looking down at the product):")
-        st.code(view_map(view), language="text")
+    st.info(f"### {hint['icon']} {hint['title']}\n\n{hint['how']}")
+    st.markdown("\n".join(f"- {tip}" for tip in hint["tips"] + COMMON_TIPS))
 
 
 FOLDER_STRUCTURE = """\
@@ -144,20 +123,6 @@ images.zip
     ├── C4/                 <- angled view 3
     └── C5/                 <- angled view 4
 """
-
-
-def template_zip():
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as archive:
-        for view in VIEWS:
-            archive.writestr(f"images/{view}/", "")
-        archive.writestr(
-            "images/README.txt",
-            "Put the photos of each camera view inside its folder (C1 to C5).\n"
-            "File name = <sample id>__<anything>.jpg   e.g. 0001__a.jpg\n"
-            "Photos of the same item share the same sample id.\n",
-        )
-    return buffer.getvalue()
 
 
 # --------------------------------------------------------------------------
@@ -423,12 +388,6 @@ if page == "Check samples":
             "- Allowed: `.jpg`, `.jpeg`, `.png`\n"
             "- **How to zip:** Windows – right-click the folder → *Send to* → *Compressed (zipped) folder*. "
             "Mac – right-click → *Compress*."
-        )
-        st.download_button(
-            "Download an empty folder template (.zip)",
-            template_zip(),
-            "images_template.zip",
-            "application/zip",
         )
 
     zip_file = st.file_uploader("Select your image folder (.zip)", type=["zip"])
