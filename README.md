@@ -1,71 +1,86 @@
-# Visual Defect Detection with PatchCore (Real-IAD)
+# Defect Detection with PatchCore + YOLO
 
-## Problem Statement
+An AI visual inspection app for electronics. It checks photos of a part and tells you:
 
-Factories need to check every product for visual defects (scratches, damage, missing or deformed parts). Doing this by eye is slow and depends on the person doing the checking. Defective images are also rare and come in many different types, so it is hard to collect enough labelled examples of every defect to train a normal classifier.
+1. **Is it defective?** (PatchCore)
+2. **Where is the problem?** (heatmap)
+3. **What kind of defect is it?** (YOLO)
 
-This project builds a system that, given a photo of a product, answers two questions:
+**Live app:** https://defect-detection0.streamlit.app/
 
-1. Is the product **normal or defective**?
-2. **Where** is the defect? (shown as a heatmap on the image)
+## How it works
 
-## Impact
+```
+Photo (5 camera views) -> PatchCore -> normal or defective?
+                                           |
+                                    if defective
+                                           v
+                                  YOLO -> defect type + box
+                                           |
+                                           v
+                          Verdict + heatmap + CSV report
+```
 
-- **Consistency:** the same model checks every image with the same rule (a threshold), instead of relying on a person's judgement.
-- **Speed:** a model gives a score for an image automatically.
-- **No defect labels needed to train:** PatchCore learns only from normal images, so it can find defect types it has never seen before.
-- **Explainable result:** the heatmap shows the inspector where to look, so the result can be checked quickly.
+- **PatchCore** learns only from normal images. There is one model per camera (C1 to C5).
+- **YOLO** only looks at the images PatchCore flagged.
+- Products: **audiojack** and **pcb**.
+- Data: [Real-IAD](https://github.com/Tencent/Real-IAD) dataset.
 
-## Scope
+## Results
 
-**Dataset:** [Real-IAD](https://huggingface.co/datasets/Real-IAD/Real-IAD) (`realiad_512`). Each product is photographed from 5 camera views (C1 to C5).
+| | Audio jack | PCB |
+|---|---|---|
+| Detection (AUROC, 5 cameras) | 0.83 - 0.91 | 0.88 - 0.92 |
+| Defect type (mAP50) | 0.91 | 0.87 |
 
-The project uses the `realiad_512` version and focuses on the `audiojack` category.
+## How to use the app
 
-**Approach:** One PatchCore model (Anomalib) is trained for each view, using only normal images. Each view gets its own threshold, chosen from the ROC curve. The notebook is run for one product category at a time (the `category` variable). This prototype was run on the **audiojack** category.
+1. Pick a product in the sidebar.
+2. **Check samples:** upload a `.zip` of your images, choose a sample ID (or all), and press check.
+3. **Manual check:** choose the camera view (C1 to C5), take a photo or upload one, and press check. A hint shows how to take the photo for each view.
+4. **Report:** see all results and download them as a CSV.
 
-**Audience:** quality-inspection use cases in manufacturing, and the course reviewers of this capstone.
+The first check of a product can take a few minutes, because the app downloads that product's models first.
 
-**Deliverables at this stage:**
+### Image zip structure
 
-- `defect_detection_per_view0.ipynb`: data preparation, training of the 5 models, evaluation, and a detection example with heatmap.
-- `app.py`: a Streamlit web app. The user chooses a view, uploads an image, and gets NORMAL/DEFECTIVE with the score and the heatmap.
-- This README.
+```
+images.zip
+└── images/
+    ├── C1/   0001__a.jpg, 0002__a.jpg ...
+    ├── C2/
+    ├── C3/
+    ├── C4/
+    └── C5/
+```
 
-**Not included in this repository:** the trained model files (`.ckpt`, about 255 MB each) and the dataset, because they are too big for GitHub.
+- Folders **C1 to C5** are the camera views (C1 = top view, C2 to C5 = angled views).
+- File name = `<sample id>__<anything>.jpg`. Photos of the same part share the same sample ID.
+- Allowed types: `.jpg`, `.jpeg`, `.png`.
 
-## Data Preparation (audiojack)
+## Files in this repo
 
-- The Real-IAD JSON file lists the train images (normal only) and the test images.
-- In the JSON: 1235 train images and 3815 test images.
-- Images are sorted into folders for each view: `train_good`, `test_good`, `test_bad` (test label `OK` = normal, anything else = defective).
-- Images per view (train / test normal / test defective):
+| File | What it is |
+|---|---|
+| `app.py` | The Streamlit app |
+| `requirements.txt` | Python packages |
+| `packages.txt` | System packages for Streamlit Cloud |
+| `defect_detection_per_view0.ipynb` | Trains the PatchCore models (one per camera) |
+| `defect_type_yolo.ipynb` | Trains the YOLO defect-type model |
 
-| View | Train | Test normal | Test defective |
-| ---- | ----- | ----------- | -------------- |
-| C1   | 247   | 550         | 213            |
-| C2   | 247   | 477         | 286            |
-| C3   | 247   | 518         | 245            |
-| C4   | 247   | 489         | 274            |
-| C5   | 247   | 485         | 278            |
+## Models
 
-## Early Results (audiojack)
+The models are too big for the repo (about 1.1 GB per product), so they are stored as zip files in the **Releases** section of this repo (`pcb.zip`, `audiojack.zip`). Each zip contains `thresholds.json`, `yolo_type.pt` and `patchcore_C1.ckpt` to `patchcore_C5.ckpt`.
 
-Image AUROC for each view model:
+The app downloads a product's zip the first time it is used. The product list comes from the `MODEL_ZIP_URLS` secret: the zip links, separated by commas. The product name is the zip file name.
 
-| View | AUROC |
-| ---- | ----- |
-| C1   | 0.831 |
-| C2   | 0.818 |
-| C3   | 0.902 |
-| C4   | 0.848 |
-| C5   | 0.843 |
+## Limitations
 
-Classification report of all views together with the per-view thresholds (class 1 = defective):
+- About 3 in 10 audio jack defects and 2 in 10 PCB defects are not flagged. Use it as a second pair of eyes, and let a person confirm.
+- The pass/fail lines were tuned on the same images used for the results, so the scores are a bit optimistic.
+- YOLO knows only 4 defect types per product, and subtle ones (for example PCB contamination) are weaker.
+- It was tested only on the Real-IAD images. Other cameras, lighting or products need testing.
 
-| Class         | Precision | Recall | F1-score | Support |
-| ------------- | --------- | ------ | -------- | ------- |
-| 0 (normal)    | 0.86      | 0.91   | 0.88     | 1261    |
-| 1 (defective) | 0.80      | 0.70   | 0.75     | 649     |
+## Author
 
-Overall accuracy: 0.84.
+Ali Yusuf Al Basri
