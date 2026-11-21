@@ -1,10 +1,25 @@
-import base64
+"""
+Defect detection - all-in-one Streamlit app (no separate API server).
+
+The model files are NOT in the GitHub code repo. For every product the app
+downloads "PRODUCT.zip" (thresholds.json, yolo_type.pt, patchcore_C1..C5.ckpt)
+from a link you put in the Streamlit secret MODEL_ZIP_URLS, the first time
+that product is used.
+
+Secret example (Streamlit Cloud -> Settings -> Secrets):
+    MODEL_ZIP_URLS = "https://github.com/YOU/REPO/releases/download/models/Bottle.zip,https://github.com/YOU/REPO/releases/download/models/Cable.zip"
+"""
+import gc
 import io
+import json
 import os
 import shutil
 import tempfile
+import threading
 import uuid
 import zipfile
+from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import pandas as pd
 import requests
@@ -14,9 +29,11 @@ st.set_page_config(page_title="Defect detection", page_icon="🔍", layout="wide
 
 VIEWS = ["C1", "C2", "C3", "C4", "C5"]
 IMAGE_EXT = (".jpg", ".jpeg", ".png")
-BATCH = 6                    # images sent to the server per request
+REQUIRED = ["thresholds.json", "yolo_type.pt"] + [f"patchcore_{v}.ckpt" for v in VIEWS]
+BATCH = 4                    # images processed together (small = less memory)
 MAX_ZIP_MB = 300
 MAX_IMAGES = 2000
+MODEL_ROOT = Path(tempfile.gettempdir()) / "defect_models"
 
 
 def get_setting(name, default=""):
@@ -29,9 +46,16 @@ def get_setting(name, default=""):
         return default
 
 
-API_URL = get_setting("API_URL", "http://localhost:8000").rstrip("/")
-API_KEY = get_setting("API_KEY")
-HEADERS = {"X-API-Key": API_KEY} if API_KEY else {}
+def parse_model_zips():
+    raw = get_setting("MODEL_ZIP_URLS")
+    if isinstance(raw, (list, tuple)):
+        urls = [str(u).strip() for u in raw]
+    else:
+        urls = [u.strip() for u in str(raw).replace("\n", ",").split(",")]
+    return {Path(unquote(urlparse(u).path)).stem: u for u in urls if u}
+
+
+MODEL_ZIPS = parse_model_zips()
 
 
 # --------------------------------------------------------------------------
@@ -137,7 +161,7 @@ def template_zip():
 
 
 # --------------------------------------------------------------------------
-# Helpers
+# Image zip helpers
 # --------------------------------------------------------------------------
 def get_id(file_name):
     return file_name.split("__")[0]
@@ -190,77 +214,173 @@ def scan_samples(root):
     return samples
 
 
-def error_detail(response):
+# --------------------------------------------------------------------------
+# Models: download once, run on this server
+# --------------------------------------------------------------------------
+@st.cache_resource(show_spinner="Downloading the models... the first time takes a few minutes.")
+def ensure_product(product, url):
+    """Download PRODUCT.zip and unpack the model files. Returns the model folder."""
+    target = MODEL_ROOT / product
+    if all((target / name).is_file() for name in REQUIRED):
+        return str(target)
+
+    target.mkdir(parents=True, exist_ok=True)
+    zip_path = MODEL_ROOT / f"{product}.zip"
     try:
-        return response.json().get("detail", response.text[:200])
-    except Exception:
-        return response.text[:200]
+        with requests.get(url, stream=True, timeout=600) as response:
+            response.raise_for_status()
+            with open(zip_path, "wb") as file:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    file.write(chunk)
+        with zipfile.ZipFile(zip_path) as archive:
+            for info in archive.infolist():
+                name = Path(info.filename).name  # base name only: no path tricks
+                if info.is_dir() or name not in REQUIRED:
+                    continue
+                with archive.open(info) as source, open(target / name, "wb") as out:
+                    shutil.copyfileobj(source, out)
+    finally:
+        zip_path.unlink(missing_ok=True)
+
+    missing = [name for name in REQUIRED if not (target / name).is_file()]
+    if missing:
+        raise RuntimeError(f"{product}.zip is missing: {', '.join(missing)}")
+    return str(target)
 
 
-@st.cache_data(ttl=60, show_spinner="Connecting to the server (it may be waking up)...")
-def get_products():
-    response = requests.get(f"{API_URL}/products", headers=HEADERS, timeout=120)
-    if response.status_code != 200:
-        raise RuntimeError(f"{response.status_code} - {error_detail(response)}")
-    return response.json()["products"]
+@st.cache_resource
+def get_yolo(path):
+    from ultralytics import YOLO
+
+    return YOLO(path)
+
+
+@st.cache_resource
+def get_lock():
+    return threading.Lock()  # one prediction at a time keeps memory low
+
+
+def make_picture(path, anomaly_map, found, title):
+    """Input | anomaly heatmap | YOLO boxes, returned as PNG bytes."""
+    from matplotlib.figure import Figure
+    from PIL import Image
+
+    img = Image.open(path).convert("RGB")
+    fig = Figure(figsize=(15, 5))
+    axes = fig.subplots(1, 3)
+    axes[0].imshow(img)
+    axes[0].set_title("Input")
+    axes[1].imshow(img.resize((anomaly_map.shape[1], anomaly_map.shape[0])))
+    axes[1].imshow(anomaly_map, cmap="jet", alpha=0.5)
+    axes[1].set_title("Anomaly heatmap")
+    axes[2].imshow(found.plot()[..., ::-1])
+    axes[2].set_title(title)
+    for axis in axes:
+        axis.axis("off")
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", bbox_inches="tight", dpi=80)
+    return buffer.getvalue()
+
+
+def run_chunk(model_dir, view, threshold, chunk):
+    """chunk = list of (sample_id, image_path). Returns one item per image."""
+    from anomalib.engine import Engine
+    from anomalib.models import Patchcore
+
+    work = Path(tempfile.mkdtemp(prefix="pred_"))
+    image_dir = work / "img"
+    image_dir.mkdir()
+    try:
+        index_of = {}
+        for number, (_, path) in enumerate(chunk):
+            temp_name = f"image_{number:06d}{Path(path).suffix.lower()}"
+            shutil.copy2(path, image_dir / temp_name)
+            index_of[temp_name] = number
+
+        model = Patchcore()
+        engine = Engine(
+            accelerator="auto",
+            devices=1,
+            enable_progress_bar=False,
+            default_root_dir=str(work / "out"),
+        )
+        predictions = engine.predict(
+            model=model,
+            data_path=str(image_dir),
+            ckpt_path=os.path.join(model_dir, f"patchcore_{view}.ckpt"),
+        )
+
+        yolo = get_yolo(os.path.join(model_dir, "yolo_type.pt"))
+        done = {}
+        for batch in predictions:
+            for i in range(len(batch.image_path)):
+                temp_name = os.path.basename(str(batch.image_path[i]))
+                if temp_name not in index_of or temp_name in done:
+                    continue
+
+                number = index_of[temp_name]
+                sample_id, path = chunk[number]
+                score = float(batch.pred_score[i])
+                anomaly_map = batch.anomaly_map[i].squeeze().cpu().numpy()
+                defective = score >= threshold
+
+                types = ""
+                picture = None
+                if defective:
+                    found = yolo(path, verbose=False)
+                    names = [
+                        f"{yolo.names[int(box.cls)]} ({float(box.conf):.2f})"
+                        for box in found[0].boxes
+                    ]
+                    types = ", ".join(names) if names else "type not found"
+                    picture = make_picture(path, anomaly_map, found[0], types)
+
+                done[temp_name] = {
+                    "sample_id": sample_id,
+                    "view": view,
+                    "path": path,
+                    "score": score,
+                    "threshold": threshold,
+                    "defective": defective,
+                    "types": types,
+                    "picture": picture,
+                }
+
+        if len(done) != len(chunk):
+            raise RuntimeError(
+                f"{view}: PatchCore returned {len(done)} predictions for {len(chunk)} images. "
+                "No partial result was saved."
+            )
+        return [done[name] for name, _ in sorted(index_of.items(), key=lambda kv: kv[1])]
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+        gc.collect()
 
 
 def check_view(product, view, files):
-    """files contains (sample_id, image_path) pairs. Calls the model server."""
+    """files contains (sample_id, image_path) pairs."""
+    model_dir = ensure_product(product, MODEL_ZIPS[product])
+    with open(os.path.join(model_dir, "thresholds.json")) as file:
+        threshold = float(json.load(file)[view])
+
     items = []
     for start in range(0, len(files), BATCH):
-        chunk = files[start:start + BATCH]
-        upload = []
-        for _, path in chunk:
-            with open(path, "rb") as file:
-                upload.append(("files", (os.path.basename(path), file.read())))
-
-        response = requests.post(
-            f"{API_URL}/predict",
-            headers=HEADERS,
-            data={"product": product, "view": view},
-            files=upload,
-            timeout=300,
-        )
-        if response.status_code != 200:
-            raise RuntimeError(f"{view}: server error {response.status_code} - {error_detail(response)}")
-
-        results = sorted(response.json()["results"], key=lambda r: r["index"])
-        if len(results) != len(chunk):
-            raise RuntimeError(
-                f"{view}: server returned {len(results)} predictions for {len(chunk)} images. "
-                "No partial result was saved."
-            )
-
-        for (sample_id, path), result in zip(chunk, results):
-            items.append({
-                "sample_id": sample_id,
-                "view": view,
-                "path": path,
-                "score": result["score"],
-                "threshold": result["threshold"],
-                "defective": result["defective"],
-                "types": result["types"],
-                "picture": base64.b64decode(result["picture"]) if result["picture"] else None,
-            })
+        with get_lock():
+            items.extend(run_chunk(model_dir, view, threshold, files[start:start + BATCH]))
     return items
 
 
 # --------------------------------------------------------------------------
 # Page setup
 # --------------------------------------------------------------------------
-try:
-    products = get_products()
-except Exception as error:
+if not MODEL_ZIPS:
     st.error(
-        "Cannot reach the detection server. If it was asleep, wait a minute and refresh.\n\n"
-        + str(error)
+        "No models configured. Add the secret MODEL_ZIP_URLS "
+        "(links to PRODUCT.zip files, separated by commas)."
     )
     st.stop()
 
-if not products:
-    st.error("The server has no product models yet.")
-    st.stop()
+products = sorted(MODEL_ZIPS)
 
 if "workdir" not in st.session_state:
     st.session_state["workdir"] = tempfile.mkdtemp(prefix="defect_")
@@ -281,6 +401,7 @@ if key not in st.session_state:
 results = st.session_state[key]
 
 chosen = None
+WAIT_TEXT = "Checking... the first check can take a few minutes while the models download."
 
 
 # --------------------------------------------------------------------------
@@ -349,7 +470,7 @@ if page == "Check samples":
 
             progress = st.progress(0.0)
             try:
-                with st.spinner("Checking... the first request can take a minute if the server was asleep."):
+                with st.spinner(WAIT_TEXT):
                     for number, view in enumerate(VIEWS, start=1):
                         files = [
                             (sample_id, path)
@@ -402,7 +523,7 @@ if page == "Manual check":
                 file.write(image_bytes)
 
             try:
-                with st.spinner("Checking... the first request can take a minute if the server was asleep."):
+                with st.spinner(WAIT_TEXT):
                     item = check_view(product, manual_view, [("manual", path)])[0]
             except Exception as error:
                 st.error(str(error))

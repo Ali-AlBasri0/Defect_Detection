@@ -1,3 +1,11 @@
-streamlit>=1.33
+--extra-index-url https://download.pytorch.org/whl/cpu
+streamlit
 pandas
 requests
+matplotlib
+pillow
+torch
+torchvision
+anomalib==2.7.0
+ultralytics
+opencv-python-headless
