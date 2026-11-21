@@ -345,6 +345,14 @@ if not MODEL_ZIPS:
     )
     st.stop()
 
+if any("/YOU/" in url for url in MODEL_ZIPS.values()):
+    st.error(
+        "The secret MODEL_ZIP_URLS still contains the example links (github.com/YOU/...). "
+        "Open Manage app -> Settings -> Secrets, replace it with your real links, "
+        "save, then reboot the app."
+    )
+    st.stop()
+
 products = sorted(MODEL_ZIPS)
 
 if "workdir" not in st.session_state:
